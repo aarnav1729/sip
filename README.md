@@ -1,4 +1,6 @@
-# Major Customer Stock Monitor
+# sip
+sip: stock intelligence platform is a custom built stock report monitoring system that collects, analyses, visualizes, and offers recommendations to enhance company wide warehouse utilization 
+
 **Premier Energies — Enterprise Email-to-DB Pipeline + Dashboard**
 
 ## Architecture
