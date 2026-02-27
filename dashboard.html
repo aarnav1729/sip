@@ -3,12 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PE · Stock Signal Room</title>
+    <title>sip</title>
     <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
     <script src="https://unpkg.com/recharts@2.8.0/umd/Recharts.js"></script>
     <script src="https://unpkg.com/@babel/standalone@7.23.2/babel.min.js"></script>
+    <link rel="icon" type="image/svg+xml" href="/l.png" />
     <link
       href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;600;700&family=DM+Sans:wght@300;400;500;600&display=swap"
       rel="stylesheet"
@@ -2459,7 +2460,42 @@
         },
       ];
 
-      function makeReports() {
+      // ═══════════════════════════════════════════════════════════════
+      // API DATA LAYER — fetches live data from /api/reports
+      // Falls back to BASE_ROWS demo data only if API is unreachable
+      // ═══════════════════════════════════════════════════════════════
+      const API_BASE = window.location.origin + "/api";
+      const POLL_INTERVAL_MS = 60 * 1000; // re-check for new reports every 60s
+
+      // Fetch the metadata list + full rows for every report
+      async function fetchAllReports() {
+        // 1. Get report list (no rows)
+        const listRes = await fetch(`${API_BASE}/reports`);
+        if (!listRes.ok)
+          throw new Error(`API ${listRes.status}: ${listRes.statusText}`);
+        const listJson = await listRes.json();
+        if (!listJson.success) throw new Error(listJson.error || "API error");
+
+        const meta = listJson.data; // sorted desc by date from API
+        if (!meta.length) return [];
+
+        // 2. Fetch full rows for each report in parallel (max 12 at once)
+        const full = await Promise.all(
+          meta.map((r) =>
+            fetch(`${API_BASE}/reports/${r._id}`)
+              .then((res) => res.json())
+              .then((j) => j.data)
+          )
+        );
+
+        // 3. Sort ascending by reportDate so charts read left→right
+        return full
+          .filter(Boolean)
+          .sort((a, b) => new Date(a.reportDate) - new Date(b.reportDate));
+      }
+
+      // Build synthetic fallback from BASE_ROWS (only used when DB is empty / unreachable)
+      function makeFallbackReports() {
         const dates = [
           "14.02.2026",
           "16.02.2026",
@@ -2492,7 +2528,7 @@
           const gt = (key) => rows.reduce((s, r) => s + (r[key] || 0), 0);
           const overall = rows.reduce((s, r) => s + r.grandTotal, 0);
           return {
-            _id: `r${d.replace(/\./g, "")}`,
+            _id: `demo_${d.replace(/\./g, "")}`,
             reportDateStr: d,
             reportDate: d.split(".").reverse().join("-") + "T00:00:00Z",
             grandTotals: {
@@ -2511,7 +2547,68 @@
         });
       }
 
-      const ALL_REPORTS = makeReports();
+      // ── useReports hook — live data + polling ─────────────────────────────────
+      function useReports() {
+        const [reports, setReports] = useState([]);
+        const [loading, setLoading] = useState(true);
+        const [error, setError] = useState(null);
+        const [isFallback, setFallback] = useState(false);
+        const [lastFetch, setLastFetch] = useState(null);
+        const prevCount = useRef(0);
+        const [newBadge, setNewBadge] = useState(false); // flashes when new report arrives
+
+        const load = useCallback(async (silent = false) => {
+          if (!silent) setLoading(true);
+          setError(null);
+          try {
+            const data = await fetchAllReports();
+            if (data.length > 0) {
+              setReports(data);
+              setFallback(false);
+              if (prevCount.current > 0 && data.length > prevCount.current) {
+                setNewBadge(true);
+                setTimeout(() => setNewBadge(false), 5000);
+              }
+              prevCount.current = data.length;
+            } else {
+              // DB empty — show demo data with a notice
+              setReports(makeFallbackReports());
+              setFallback(true);
+            }
+          } catch (err) {
+            // API unreachable — show demo data with error notice
+            if (!silent) {
+              setReports(makeFallbackReports());
+              setFallback(true);
+              setError(err.message);
+            }
+          } finally {
+            setLoading(false);
+            setLastFetch(new Date());
+          }
+        }, []);
+
+        // Initial load
+        useEffect(() => {
+          load();
+        }, [load]);
+
+        // Silent background polling for new reports
+        useEffect(() => {
+          const id = setInterval(() => load(true), POLL_INTERVAL_MS);
+          return () => clearInterval(id);
+        }, [load]);
+
+        return {
+          reports,
+          loading,
+          error,
+          isFallback,
+          newBadge,
+          lastFetch,
+          reload: load,
+        };
+      }
 
       // ═══════════════════════════════════════════════════════════════
       // SHARED COMPONENTS
@@ -6070,10 +6167,16 @@
         }, []);
 
         const [tab, setTab] = useState("overview");
-        const reports = ALL_REPORTS;
-        const [selectedReportId, setSelectedReportId] = useState(
-          reports[reports.length - 1]._id
-        );
+        const {
+          reports,
+          loading,
+          error,
+          isFallback,
+          newBadge,
+          lastFetch,
+          reload,
+        } = useReports();
+        const [selectedReportId, setSelectedReportId] = useState(null);
         const [hiddenCustomers, setHiddenCustomers] = useState(new Set());
         const [searchQ, setSearchQ] = useState("");
         const [sortCol, setSortCol] = useState("grandTotal");
@@ -6083,14 +6186,26 @@
         const exportRef = useRef(null);
         const [drill, setDrill] = useState({ level: 0 });
 
-        const report = useMemo(
-          () =>
+        // Auto-select the latest report whenever data loads or a new report arrives
+        useEffect(() => {
+          if (reports.length > 0) {
+            setSelectedReportId((id) => {
+              const stillExists = reports.find((r) => r._id === id);
+              return stillExists ? id : reports[reports.length - 1]._id;
+            });
+          }
+        }, [reports]);
+
+        const report = useMemo(() => {
+          if (!reports.length) return null;
+          return (
             reports.find((r) => r._id === selectedReportId) ||
-            reports[reports.length - 1],
-          [reports, selectedReportId]
-        );
+            reports[reports.length - 1]
+          );
+        }, [reports, selectedReportId]);
 
         const allRows = useMemo(() => {
+          if (!report) return [];
           const seen = new Set();
           return report.rows.filter((r) => {
             const k = `${r.customerName}__${r.wp}`;
@@ -6101,6 +6216,7 @@
         }, [report]);
 
         const filteredRows = useMemo(() => {
+          if (!report) return [];
           let rows = report.rows.filter(
             (r) => !hiddenCustomers.has(`${r.customerName}__${r.wp}`)
           );
@@ -6130,15 +6246,19 @@
 
         const latest = reports[reports.length - 1];
         const prev = reports[reports.length - 2];
-        const totalDelta =
-          (latest?.grandTotals.overall || 0) - (prev?.grandTotals.overall || 0);
-        const topCustomer = [...report.rows].sort(
-          (a, b) => b.grandTotal - a.grandTotal
-        )[0];
-        const topWH = WAREHOUSES.map((w) => ({
-          ...w,
-          v: report.grandTotals?.[w.key] || 0,
-        })).sort((a, b) => b.v - a.v)[0];
+        const totalDelta = report
+          ? (latest?.grandTotals.overall || 0) -
+            (prev?.grandTotals.overall || 0)
+          : 0;
+        const topCustomer = report
+          ? [...report.rows].sort((a, b) => b.grandTotal - a.grandTotal)[0]
+          : null;
+        const topWH = report
+          ? WAREHOUSES.map((w) => ({
+              ...w,
+              v: report.grandTotals?.[w.key] || 0,
+            })).sort((a, b) => b.v - a.v)[0]
+          : null;
 
         const tsTotals = reports.map((r) => ({
           date: r.reportDateStr,
@@ -6149,6 +6269,7 @@
         }));
 
         const custLines = useMemo(() => {
+          if (!report) return { keys: [], data: [] };
           const top8 = allRows
             .filter((r) => !hiddenCustomers.has(`${r.customerName}__${r.wp}`))
             .slice(0, 8);
@@ -6171,12 +6292,14 @@
               ),
             })),
           };
-        }, [reports, allRows, hiddenCustomers, selectedWH]);
+        }, [reports, allRows, hiddenCustomers, selectedWH, report]);
 
-        const pieData = WAREHOUSES.map((w) => ({
-          name: w.label,
-          value: report.grandTotals?.[w.key] || 0,
-        })).filter((d) => d.value > 0);
+        const pieData = report
+          ? WAREHOUSES.map((w) => ({
+              name: w.label,
+              value: report.grandTotals?.[w.key] || 0,
+            })).filter((d) => d.value > 0)
+          : [];
 
         useEffect(() => {
           const h = (e) => {
@@ -6196,7 +6319,7 @@
         const backToCustomer = () =>
           setDrill((d) => ({ level: 2, type: "cust", customer: d.customer }));
 
-        const animatedTotal = useCountUp(report.grandTotals?.overall || 0);
+        const animatedTotal = useCountUp(report?.grandTotals?.overall || 0);
         const animatedDelta = useCountUp(Math.abs(totalDelta));
 
         const NAV = [
@@ -6243,13 +6366,13 @@
         );
 
         const handleWhBarClick = (data) => {
-          if (!data?.activePayload?.[0]) return;
+          if (!data?.activePayload?.[0] || !report) return;
           const label = data.activePayload[0].payload.name;
           const wh = WAREHOUSES.find((w) => w.label === label);
           if (wh) drillWarehouse(wh);
         };
         const handleCustBarClick = (data) => {
-          if (!data?.activePayload?.[0]) return;
+          if (!data?.activePayload?.[0] || !report) return;
           const name = data.activePayload[0].payload.name;
           const row = report.rows.find((r) =>
             r.customerName.startsWith(name.replace("…", "").trim())
@@ -6262,6 +6385,73 @@
             {showTutorial && (
               <TutorialModal onClose={() => setShowTutorial(false)} />
             )}
+
+            {/* ── FULL-SCREEN LOADING ──────────────────────────── */}
+            {loading && (
+              <div
+                style={{
+                  position: "fixed",
+                  inset: 0,
+                  zIndex: 9999,
+                  background: "var(--bg)",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 20,
+                }}
+              >
+                <div
+                  style={{
+                    width: 48,
+                    height: 48,
+                    borderRadius: 14,
+                    background:
+                      "linear-gradient(135deg,var(--teal),var(--sky))",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontFamily: "Syne,sans-serif",
+                    fontWeight: 800,
+                    fontSize: 16,
+                    color: "#000",
+                    animation: "glow 2s ease infinite",
+                  }}
+                >
+                  PE
+                </div>
+                <div
+                  style={{
+                    fontFamily: "JetBrains Mono,monospace",
+                    fontSize: 12,
+                    color: "var(--muted)",
+                  }}
+                >
+                  Loading reports from database…
+                </div>
+                <div
+                  style={{
+                    width: 200,
+                    height: 2,
+                    background: "var(--faint)",
+                    borderRadius: 2,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      height: "100%",
+                      background:
+                        "linear-gradient(90deg,var(--teal),var(--sky))",
+                      borderRadius: 2,
+                      animation: "loadBar 1.4s ease infinite",
+                    }}
+                  />
+                </div>
+                <style>{`@keyframes loadBar{0%{width:0%;margin-left:0}60%{width:100%;margin-left:0}100%{width:0%;margin-left:100%}}`}</style>
+              </div>
+            )}
+
             {/* RAIL */}
             <nav className="rail">
               <div
@@ -6319,6 +6509,72 @@
                     <div className="live-dot" />
                     LIVE
                   </div>
+
+                  {/* New report badge */}
+                  {newBadge && (
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        background: "rgba(6,214,160,.15)",
+                        border: "1px solid var(--teal)",
+                        borderRadius: 20,
+                        padding: "4px 12px",
+                        fontFamily: "JetBrains Mono,monospace",
+                        fontSize: 11,
+                        color: "var(--teal)",
+                        animation: "fadeIn .3s ease",
+                      }}
+                    >
+                      ⬆ New report loaded
+                    </div>
+                  )}
+
+                  {/* Fallback / demo banner */}
+                  {isFallback && (
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        background: "rgba(255,209,102,.10)",
+                        border: "1px solid rgba(255,209,102,.35)",
+                        borderRadius: 8,
+                        padding: "4px 12px",
+                        fontFamily: "JetBrains Mono,monospace",
+                        fontSize: 10,
+                        color: "var(--amber)",
+                        cursor: "pointer",
+                      }}
+                      onClick={() => reload()}
+                      title={
+                        error
+                          ? `API error: ${error}`
+                          : "No reports in database yet"
+                      }
+                    >
+                      {error
+                        ? "⚠ API unreachable — showing demo data · click to retry"
+                        : "◎ No DB reports yet — showing demo data"}
+                    </div>
+                  )}
+
+                  {/* Last fetch time */}
+                  {lastFetch && !isFallback && (
+                    <div
+                      style={{
+                        fontFamily: "JetBrains Mono,monospace",
+                        fontSize: 10,
+                        color: "var(--muted)",
+                        cursor: "pointer",
+                      }}
+                      onClick={() => reload()}
+                      title="Click to refresh now"
+                    >
+                      ↺ {lastFetch.toLocaleTimeString()}
+                    </div>
+                  )}
                   <div className="report-selector">
                     {reports.map((r) => (
                       <div
@@ -6382,1087 +6638,1184 @@
 
               {/* CONTENT */}
               <div className="content">
-                {/* ─── DRILLDOWN VIEWS ─────────────────────────────── */}
-                {drill.level === 1 && drill.type === "wh" && (
-                  <WarehouseDetail
-                    wh={drill.wh}
-                    reports={reports}
-                    report={report}
-                    onBack={backToOverview}
-                    onCustomerDrill={drillCustomer}
-                  />
-                )}
-                {drill.level === 2 && drill.type === "cust" && (
-                  <CustomerDetail
-                    customer={drill.customer}
-                    reports={reports}
-                    report={report}
-                    onBack={backToOverview}
-                    onWhDrill={(wh) => drillCxW(drill.customer, wh)}
-                  />
-                )}
-                {drill.level === 3 && drill.type === "cxw" && (
-                  <CxWDetail
-                    customer={drill.customer}
-                    wh={drill.wh}
-                    reports={reports}
-                    report={report}
-                    onBack={backToOverview}
-                    onBackToCustomer={backToCustomer}
-                  />
+                {/* ─── NULL GUARD (data loading / empty) ───────────────────── */}
+                {!report && !loading && (
+                  <div
+                    style={{
+                      flex: 1,
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: 16,
+                      padding: 60,
+                      textAlign: "center",
+                    }}
+                  >
+                    <div style={{ fontSize: 40 }}>📭</div>
+                    <div
+                      style={{
+                        fontFamily: "Syne,sans-serif",
+                        fontSize: 20,
+                        fontWeight: 800,
+                        color: "var(--text)",
+                      }}
+                    >
+                      No reports found
+                    </div>
+                    <div
+                      style={{
+                        fontSize: 13,
+                        color: "var(--muted)",
+                        maxWidth: 380,
+                        lineHeight: 1.7,
+                      }}
+                    >
+                      The database is empty. Run a backfill to seed historical
+                      reports, or wait for the next email poll to capture a new
+                      one.
+                    </div>
+                    <div
+                      style={{
+                        fontFamily: "JetBrains Mono,monospace",
+                        fontSize: 11,
+                        background: "var(--surface)",
+                        border: "1px solid var(--border)",
+                        borderRadius: 8,
+                        padding: "8px 16px",
+                        color: "var(--muted)",
+                      }}
+                    >
+                      node server.js --backfill 10
+                    </div>
+                    <button className="btn btn-teal" onClick={() => reload()}>
+                      ↺ Retry
+                    </button>
+                  </div>
                 )}
 
-                {drill.level === 0 && (
+                {/* ─── DRILLDOWN VIEWS ─────────────────────────────── */}
+                {report && (
                   <>
-                    {/* ═══════════════════════════════════════════════════
+                    {drill.level === 1 && drill.type === "wh" && (
+                      <WarehouseDetail
+                        wh={drill.wh}
+                        reports={reports}
+                        report={report}
+                        onBack={backToOverview}
+                        onCustomerDrill={drillCustomer}
+                      />
+                    )}
+                    {drill.level === 2 && drill.type === "cust" && (
+                      <CustomerDetail
+                        customer={drill.customer}
+                        reports={reports}
+                        report={report}
+                        onBack={backToOverview}
+                        onWhDrill={(wh) => drillCxW(drill.customer, wh)}
+                      />
+                    )}
+                    {drill.level === 3 && drill.type === "cxw" && (
+                      <CxWDetail
+                        customer={drill.customer}
+                        wh={drill.wh}
+                        reports={reports}
+                        report={report}
+                        onBack={backToOverview}
+                        onBackToCustomer={backToCustomer}
+                      />
+                    )}
+
+                    {drill.level === 0 && (
+                      <>
+                        {/* ═══════════════════════════════════════════════════
               OVERVIEW TAB
           ═══════════════════════════════════════════════════ */}
-                    {tab === "overview" && (
-                      <>
-                        {/* HERO */}
-                        <div className="hero fade-up">
-                          <div className="hero-grid">
-                            <div className="hero-main">
-                              <div className="hero-label">
-                                Total Stock Units
-                              </div>
-                              <div className="hero-value">
-                                {fmt(animatedTotal)}
-                                <span className="hero-unit">units</span>
-                              </div>
-                              <div
-                                className={`hero-delta ${
-                                  totalDelta >= 0 ? "up" : "down"
-                                }`}
-                              >
-                                {totalDelta >= 0 ? "▲" : "▼"}{" "}
-                                {fmt(animatedDelta)} vs prev period
-                                {prev && (
-                                  <span style={{ marginLeft: 8, opacity: 0.6 }}>
-                                    (
-                                    {prev
-                                      ? (
-                                          (totalDelta /
-                                            (prev.grandTotals.overall || 1)) *
-                                          100
-                                        ).toFixed(1)
-                                      : "—"}
-                                    %)
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                            <div className="hero-stat">
-                              <div className="hero-label">Top Customer</div>
-                              <div
-                                className="hero-value"
-                                style={{ fontSize: 20, color: "var(--teal)" }}
-                              >
-                                {topCustomer?.customerName || "—"}
-                              </div>
-                              <div
-                                className="hero-label"
-                                style={{ marginTop: 4 }}
-                              >
-                                {fmt(topCustomer?.grandTotal)} units
-                              </div>
-                            </div>
-                            <div className="hero-stat">
-                              <div className="hero-label">Top Warehouse</div>
-                              <div
-                                className="hero-value"
-                                style={{ fontSize: 20, color: "var(--amber)" }}
-                              >
-                                {topWH?.label || "—"}
-                              </div>
-                              <div
-                                className="hero-label"
-                                style={{ marginTop: 4 }}
-                              >
-                                {pct(
-                                  topWH?.v || 0,
-                                  report.grandTotals?.overall || 1
-                                )}{" "}
-                                of total
-                              </div>
-                            </div>
-                            <div className="hero-stat">
-                              <div className="hero-label">Active Customers</div>
-                              <div
-                                className="hero-value"
-                                style={{ fontSize: 28 }}
-                              >
-                                {
-                                  report.rows.filter((r) => r.grandTotal > 0)
-                                    .length
-                                }
-                              </div>
-                              <div
-                                className="hero-label"
-                                style={{ marginTop: 4 }}
-                              >
-                                across{" "}
-                                {
-                                  WAREHOUSES.filter(
-                                    (w) =>
-                                      (report.grandTotals?.[w.key] || 0) > 0
-                                  ).length
-                                }{" "}
-                                warehouses
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* WAREHOUSE DISTRIBUTION + CUSTOMER BAR */}
-                        <div className="two-col">
-                          <div className="panel fade-up a2">
-                            <div className="panel-head">
-                              <span className="panel-title">
-                                <span
-                                  className="panel-title-dot"
-                                  style={{ background: "var(--amber)" }}
-                                />{" "}
-                                Warehouse Distribution
-                              </span>
-                              <span
-                                style={{
-                                  fontSize: 10,
-                                  fontFamily: "JetBrains Mono",
-                                  color: "var(--muted)",
-                                }}
-                              >
-                                Click to drill
-                              </span>
-                            </div>
-                            <div className="panel-body">
-                              <ResponsiveContainer width="100%" height={200}>
-                                <BarChart
-                                  data={WAREHOUSES.map((w) => ({
-                                    name: w.label,
-                                    value: report.grandTotals?.[w.key] || 0,
-                                  }))}
-                                  onClick={handleWhBarClick}
-                                  style={{ cursor: "pointer" }}
-                                >
-                                  <CartesianGrid
-                                    strokeDasharray="3 3"
-                                    stroke="var(--border)"
-                                    vertical={false}
-                                  />
-                                  <XAxis
-                                    dataKey="name"
-                                    tick={{
-                                      fill: "var(--muted)",
-                                      fontSize: 9,
-                                      fontFamily: "JetBrains Mono",
-                                    }}
-                                    axisLine={false}
-                                    tickLine={false}
-                                  />
-                                  <YAxis hide />
-                                  <Tooltip content={<TT />} />
-                                  <Bar
-                                    dataKey="value"
-                                    name="Units"
-                                    radius={[4, 4, 0, 0]}
+                        {tab === "overview" && (
+                          <>
+                            {/* HERO */}
+                            <div className="hero fade-up">
+                              <div className="hero-grid">
+                                <div className="hero-main">
+                                  <div className="hero-label">
+                                    Total Stock Units
+                                  </div>
+                                  <div className="hero-value">
+                                    {fmt(animatedTotal)}
+                                    <span className="hero-unit">units</span>
+                                  </div>
+                                  <div
+                                    className={`hero-delta ${
+                                      totalDelta >= 0 ? "up" : "down"
+                                    }`}
                                   >
-                                    {WAREHOUSES.map((_, i) => (
-                                      <Cell key={i} fill={P[i]} />
+                                    {totalDelta >= 0 ? "▲" : "▼"}{" "}
+                                    {fmt(animatedDelta)} vs prev period
+                                    {prev && (
+                                      <span
+                                        style={{ marginLeft: 8, opacity: 0.6 }}
+                                      >
+                                        (
+                                        {prev
+                                          ? (
+                                              (totalDelta /
+                                                (prev.grandTotals.overall ||
+                                                  1)) *
+                                              100
+                                            ).toFixed(1)
+                                          : "—"}
+                                        %)
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="hero-stat">
+                                  <div className="hero-label">Top Customer</div>
+                                  <div
+                                    className="hero-value"
+                                    style={{
+                                      fontSize: 20,
+                                      color: "var(--teal)",
+                                    }}
+                                  >
+                                    {topCustomer?.customerName || "—"}
+                                  </div>
+                                  <div
+                                    className="hero-label"
+                                    style={{ marginTop: 4 }}
+                                  >
+                                    {fmt(topCustomer?.grandTotal)} units
+                                  </div>
+                                </div>
+                                <div className="hero-stat">
+                                  <div className="hero-label">
+                                    Top Warehouse
+                                  </div>
+                                  <div
+                                    className="hero-value"
+                                    style={{
+                                      fontSize: 20,
+                                      color: "var(--amber)",
+                                    }}
+                                  >
+                                    {topWH?.label || "—"}
+                                  </div>
+                                  <div
+                                    className="hero-label"
+                                    style={{ marginTop: 4 }}
+                                  >
+                                    {pct(
+                                      topWH?.v || 0,
+                                      report.grandTotals?.overall || 1
+                                    )}{" "}
+                                    of total
+                                  </div>
+                                </div>
+                                <div className="hero-stat">
+                                  <div className="hero-label">
+                                    Active Customers
+                                  </div>
+                                  <div
+                                    className="hero-value"
+                                    style={{ fontSize: 28 }}
+                                  >
+                                    {
+                                      report.rows.filter(
+                                        (r) => r.grandTotal > 0
+                                      ).length
+                                    }
+                                  </div>
+                                  <div
+                                    className="hero-label"
+                                    style={{ marginTop: 4 }}
+                                  >
+                                    across{" "}
+                                    {
+                                      WAREHOUSES.filter(
+                                        (w) =>
+                                          (report.grandTotals?.[w.key] || 0) > 0
+                                      ).length
+                                    }{" "}
+                                    warehouses
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* WAREHOUSE DISTRIBUTION + CUSTOMER BAR */}
+                            <div className="two-col">
+                              <div className="panel fade-up a2">
+                                <div className="panel-head">
+                                  <span className="panel-title">
+                                    <span
+                                      className="panel-title-dot"
+                                      style={{ background: "var(--amber)" }}
+                                    />{" "}
+                                    Warehouse Distribution
+                                  </span>
+                                  <span
+                                    style={{
+                                      fontSize: 10,
+                                      fontFamily: "JetBrains Mono",
+                                      color: "var(--muted)",
+                                    }}
+                                  >
+                                    Click to drill
+                                  </span>
+                                </div>
+                                <div className="panel-body">
+                                  <ResponsiveContainer
+                                    width="100%"
+                                    height={200}
+                                  >
+                                    <BarChart
+                                      data={WAREHOUSES.map((w) => ({
+                                        name: w.label,
+                                        value: report.grandTotals?.[w.key] || 0,
+                                      }))}
+                                      onClick={handleWhBarClick}
+                                      style={{ cursor: "pointer" }}
+                                    >
+                                      <CartesianGrid
+                                        strokeDasharray="3 3"
+                                        stroke="var(--border)"
+                                        vertical={false}
+                                      />
+                                      <XAxis
+                                        dataKey="name"
+                                        tick={{
+                                          fill: "var(--muted)",
+                                          fontSize: 9,
+                                          fontFamily: "JetBrains Mono",
+                                        }}
+                                        axisLine={false}
+                                        tickLine={false}
+                                      />
+                                      <YAxis hide />
+                                      <Tooltip content={<TT />} />
+                                      <Bar
+                                        dataKey="value"
+                                        name="Units"
+                                        radius={[4, 4, 0, 0]}
+                                      >
+                                        {WAREHOUSES.map((_, i) => (
+                                          <Cell key={i} fill={P[i]} />
+                                        ))}
+                                      </Bar>
+                                    </BarChart>
+                                  </ResponsiveContainer>
+                                </div>
+                              </div>
+                              <div className="panel fade-up a3">
+                                <div className="panel-head">
+                                  <span className="panel-title">
+                                    <span
+                                      className="panel-title-dot"
+                                      style={{ background: "var(--teal)" }}
+                                    />{" "}
+                                    Top 10 Customers
+                                  </span>
+                                  <span
+                                    style={{
+                                      fontSize: 10,
+                                      fontFamily: "JetBrains Mono",
+                                      color: "var(--muted)",
+                                    }}
+                                  >
+                                    Click to drill
+                                  </span>
+                                </div>
+                                <div className="panel-body">
+                                  <ResponsiveContainer
+                                    width="100%"
+                                    height={200}
+                                  >
+                                    <BarChart
+                                      layout="vertical"
+                                      data={[...report.rows]
+                                        .sort(
+                                          (a, b) => b.grandTotal - a.grandTotal
+                                        )
+                                        .slice(0, 10)
+                                        .map((r) => ({
+                                          name:
+                                            r.customerName.length > 18
+                                              ? r.customerName.slice(0, 18) +
+                                                "…"
+                                              : r.customerName,
+                                          value: r.grandTotal,
+                                          _row: r,
+                                        }))}
+                                      onClick={(d) => {
+                                        if (d?.activePayload?.[0]) {
+                                          const row =
+                                            d.activePayload[0].payload._row;
+                                          if (row) drillCustomer(row);
+                                        }
+                                      }}
+                                    >
+                                      <CartesianGrid
+                                        strokeDasharray="3 3"
+                                        stroke="var(--border)"
+                                        horizontal={false}
+                                      />
+                                      <XAxis type="number" hide />
+                                      <YAxis
+                                        type="category"
+                                        dataKey="name"
+                                        tick={{
+                                          fill: "var(--muted)",
+                                          fontSize: 9,
+                                          fontFamily: "JetBrains Mono",
+                                        }}
+                                        axisLine={false}
+                                        tickLine={false}
+                                        width={120}
+                                      />
+                                      <Tooltip content={<TT />} />
+                                      <Bar
+                                        dataKey="value"
+                                        name="Units"
+                                        radius={[0, 4, 4, 0]}
+                                        style={{ cursor: "pointer" }}
+                                      >
+                                        {[...Array(10)].map((_, i) => (
+                                          <Cell key={i} fill={P[i]} />
+                                        ))}
+                                      </Bar>
+                                    </BarChart>
+                                  </ResponsiveContainer>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* PORTFOLIO TREND */}
+                            <div className="panel fade-up a4">
+                              <div className="panel-head">
+                                <span className="panel-title">
+                                  <span
+                                    className="panel-title-dot"
+                                    style={{ background: "var(--sky)" }}
+                                  />{" "}
+                                  Portfolio Stock Trend
+                                </span>
+                              </div>
+                              <div className="panel-body">
+                                <ResponsiveContainer width="100%" height={180}>
+                                  <AreaChart data={tsTotals}>
+                                    <defs>
+                                      <linearGradient
+                                        id="totDg"
+                                        x1="0"
+                                        y1="0"
+                                        x2="0"
+                                        y2="1"
+                                      >
+                                        <stop
+                                          offset="5%"
+                                          stopColor="var(--sky)"
+                                          stopOpacity={0.3}
+                                        />
+                                        <stop
+                                          offset="95%"
+                                          stopColor="var(--sky)"
+                                          stopOpacity={0}
+                                        />
+                                      </linearGradient>
+                                    </defs>
+                                    <CartesianGrid
+                                      strokeDasharray="3 3"
+                                      stroke="var(--border)"
+                                      vertical={false}
+                                    />
+                                    <XAxis
+                                      dataKey="date"
+                                      tick={{
+                                        fill: "var(--muted)",
+                                        fontSize: 9,
+                                        fontFamily: "JetBrains Mono",
+                                      }}
+                                      axisLine={false}
+                                      tickLine={false}
+                                    />
+                                    <YAxis hide />
+                                    <Tooltip content={<TT />} />
+                                    <Area
+                                      type="monotone"
+                                      dataKey="Total"
+                                      stroke="var(--sky)"
+                                      strokeWidth={2.5}
+                                      fill="url(#totDg)"
+                                      dot={false}
+                                    />
+                                  </AreaChart>
+                                </ResponsiveContainer>
+                              </div>
+                            </div>
+
+                            {/* KPI CARDS */}
+                            <div className="card-grid">
+                              {WAREHOUSES.map((wh, i) => {
+                                const v = report.grandTotals?.[wh.key] || 0;
+                                const pv2 = prev?.grandTotals?.[wh.key] || 0;
+                                const d2 = v - pv2;
+                                const dp =
+                                  pv2 > 0
+                                    ? ((d2 / pv2) * 100).toFixed(1)
+                                    : null;
+                                return (
+                                  <div
+                                    key={wh.key}
+                                    className="card clickable fade-up"
+                                    style={{ animationDelay: `${i * 0.04}s` }}
+                                    onClick={() => drillWarehouse(wh)}
+                                  >
+                                    <div
+                                      className="card-accent"
+                                      style={{ background: P[i] }}
+                                    />
+                                    <div className="card-label">{wh.label}</div>
+                                    <div
+                                      className="card-value"
+                                      style={{ color: P[i] }}
+                                    >
+                                      {fmt(v)}
+                                    </div>
+                                    <div className="card-sub">
+                                      {dp !== null && (
+                                        <span
+                                          style={{
+                                            color:
+                                              d2 >= 0
+                                                ? "var(--teal)"
+                                                : "var(--coral)",
+                                            fontFamily: "JetBrains Mono",
+                                            fontSize: 11,
+                                          }}
+                                        >
+                                          {d2 >= 0 ? "+" : ""}
+                                          {dp}%{" "}
+                                        </span>
+                                      )}
+                                      {pct(v, report.grandTotals?.overall || 1)}{" "}
+                                      of total
+                                    </div>
+                                    <div className="card-badge">drill ›</div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+
+                        {/* ═══════════════════════════════════════════════════
+              TRENDS TAB
+          ═══════════════════════════════════════════════════ */}
+                        {tab === "trends" && (
+                          <>
+                            <div className="panel fade-up">
+                              <div className="panel-head">
+                                <span className="panel-title">
+                                  <span
+                                    className="panel-title-dot"
+                                    style={{ background: "var(--sky)" }}
+                                  />{" "}
+                                  Warehouse Stock Over Time
+                                </span>
+                              </div>
+                              <div className="panel-body">
+                                <ResponsiveContainer width="100%" height={260}>
+                                  <LineChart data={tsTotals}>
+                                    <CartesianGrid
+                                      strokeDasharray="3 3"
+                                      stroke="var(--border)"
+                                      vertical={false}
+                                    />
+                                    <XAxis
+                                      dataKey="date"
+                                      tick={{
+                                        fill: "var(--muted)",
+                                        fontSize: 9,
+                                        fontFamily: "JetBrains Mono",
+                                      }}
+                                      axisLine={false}
+                                      tickLine={false}
+                                    />
+                                    <YAxis hide />
+                                    <Tooltip content={<TT />} />
+                                    <Legend
+                                      wrapperStyle={{
+                                        fontSize: 10,
+                                        fontFamily: "JetBrains Mono",
+                                      }}
+                                    />
+                                    {WAREHOUSES.map((w, i) => (
+                                      <Line
+                                        key={w.key}
+                                        type="monotone"
+                                        dataKey={w.label}
+                                        stroke={P[i]}
+                                        strokeWidth={2}
+                                        dot={false}
+                                        activeDot={{ r: 5 }}
+                                      />
                                     ))}
-                                  </Bar>
-                                </BarChart>
-                              </ResponsiveContainer>
+                                  </LineChart>
+                                </ResponsiveContainer>
+                              </div>
+                            </div>
+                            <div className="panel fade-up a2">
+                              <div className="panel-head">
+                                <span className="panel-title">
+                                  <span
+                                    className="panel-title-dot"
+                                    style={{ background: "var(--teal)" }}
+                                  />{" "}
+                                  Customer Stock Trends
+                                </span>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    gap: 6,
+                                    flexWrap: "wrap",
+                                  }}
+                                >
+                                  <div className="wh-pills">
+                                    {[
+                                      { key: "grandTotal", label: "Total" },
+                                      ...WAREHOUSES,
+                                    ].map((w) => (
+                                      <div
+                                        key={w.key}
+                                        className={`wh-pill${
+                                          selectedWH === w.key ? " on" : ""
+                                        }`}
+                                        onClick={() => setSelectedWH(w.key)}
+                                      >
+                                        {w.label || w.short}
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="panel-body">
+                                <ResponsiveContainer width="100%" height={240}>
+                                  <LineChart data={custLines.data}>
+                                    <CartesianGrid
+                                      strokeDasharray="3 3"
+                                      stroke="var(--border)"
+                                      vertical={false}
+                                    />
+                                    <XAxis
+                                      dataKey="date"
+                                      tick={{
+                                        fill: "var(--muted)",
+                                        fontSize: 9,
+                                        fontFamily: "JetBrains Mono",
+                                      }}
+                                      axisLine={false}
+                                      tickLine={false}
+                                    />
+                                    <YAxis hide />
+                                    <Tooltip content={<TT />} />
+                                    <Legend
+                                      wrapperStyle={{
+                                        fontSize: 10,
+                                        fontFamily: "JetBrains Mono",
+                                      }}
+                                    />
+                                    {custLines.keys.map((k, i) => (
+                                      <Line
+                                        key={k}
+                                        type="monotone"
+                                        dataKey={k}
+                                        stroke={P[i]}
+                                        strokeWidth={2}
+                                        dot={false}
+                                        activeDot={{ r: 4 }}
+                                      />
+                                    ))}
+                                  </LineChart>
+                                </ResponsiveContainer>
+                              </div>
+                            </div>
+                            <div className="panel fade-up a3">
+                              <div className="panel-head">
+                                <span className="panel-title">
+                                  <span
+                                    className="panel-title-dot"
+                                    style={{ background: "var(--amber)" }}
+                                  />{" "}
+                                  Warehouse Share — Stacked Area
+                                </span>
+                              </div>
+                              <div className="panel-body">
+                                <ResponsiveContainer width="100%" height={200}>
+                                  <AreaChart data={tsTotals}>
+                                    <CartesianGrid
+                                      strokeDasharray="3 3"
+                                      stroke="var(--border)"
+                                      vertical={false}
+                                    />
+                                    <XAxis
+                                      dataKey="date"
+                                      tick={{
+                                        fill: "var(--muted)",
+                                        fontSize: 9,
+                                        fontFamily: "JetBrains Mono",
+                                      }}
+                                      axisLine={false}
+                                      tickLine={false}
+                                    />
+                                    <YAxis hide />
+                                    <Tooltip content={<TT />} />
+                                    <Legend
+                                      wrapperStyle={{
+                                        fontSize: 10,
+                                        fontFamily: "JetBrains Mono",
+                                      }}
+                                    />
+                                    {WAREHOUSES.map((w, i) => (
+                                      <Area
+                                        key={w.key}
+                                        type="monotone"
+                                        dataKey={w.label}
+                                        stackId="1"
+                                        stroke={P[i]}
+                                        fill={P[i] + "55"}
+                                        strokeWidth={1.5}
+                                        dot={false}
+                                      />
+                                    ))}
+                                  </AreaChart>
+                                </ResponsiveContainer>
+                              </div>
+                            </div>
+                          </>
+                        )}
+
+                        {/* ═══════════════════════════════════════════════════
+              WAREHOUSES TAB
+          ═══════════════════════════════════════════════════ */}
+                        {tab === "warehouses" && (
+                          <div className="fade-up">
+                            <div className="wh-grid">
+                              {WAREHOUSES.map((wh, wi) => {
+                                const v = report.grandTotals?.[wh.key] || 0;
+                                const pv2 = prev?.grandTotals?.[wh.key] || 0;
+                                const d2 = v - pv2;
+                                const ts2 = reports.map(
+                                  (r) => r.grandTotals?.[wh.key] || 0
+                                );
+                                const mx = Math.max(...ts2, 1);
+                                const share =
+                                  report.grandTotals?.overall > 0
+                                    ? (
+                                        (v / report.grandTotals.overall) *
+                                        100
+                                      ).toFixed(1)
+                                    : "0";
+                                const custCount = report.rows.filter(
+                                  (r) => (r[wh.key] || 0) > 0
+                                ).length;
+                                return (
+                                  <div
+                                    key={wh.key}
+                                    className="wh-tile fade-up"
+                                    style={{ animationDelay: `${wi * 0.05}s` }}
+                                    onClick={() => drillWarehouse(wh)}
+                                  >
+                                    <div
+                                      className="wh-tile-bar"
+                                      style={{ background: P[wi] }}
+                                    />
+                                    <div className="wh-tile-body">
+                                      <div
+                                        className="wh-tile-share"
+                                        style={{ color: P[wi] }}
+                                      >
+                                        {share}%
+                                      </div>
+                                      <div
+                                        className="wh-tile-name"
+                                        style={{ color: P[wi] }}
+                                      >
+                                        {wh.label}
+                                      </div>
+                                      <div className="wh-tile-val">
+                                        {fmt(v)}
+                                      </div>
+                                      <div
+                                        style={{
+                                          display: "flex",
+                                          gap: 2,
+                                          alignItems: "flex-end",
+                                          marginBottom: 10,
+                                          height: 32,
+                                        }}
+                                      >
+                                        {ts2.map((tv, j) => {
+                                          const bh = Math.max(
+                                            3,
+                                            Math.round((tv / mx) * 32)
+                                          );
+                                          const isLast = j === ts2.length - 1;
+                                          return (
+                                            <div
+                                              key={j}
+                                              style={{
+                                                width: 6,
+                                                height: bh,
+                                                background: isLast
+                                                  ? P[wi]
+                                                  : P[wi] + "55",
+                                                borderRadius: 2,
+                                                transition: "height .3s",
+                                              }}
+                                            />
+                                          );
+                                        })}
+                                      </div>
+                                      <div className="wh-tile-meta">
+                                        <span>{custCount} customers</span>
+                                        <span
+                                          style={{
+                                            color:
+                                              d2 >= 0
+                                                ? "var(--teal)"
+                                                : "var(--coral)",
+                                            fontFamily: "JetBrains Mono",
+                                            fontSize: 11,
+                                          }}
+                                        >
+                                          {d2 >= 0 ? "+" : ""}
+                                          {fmt(d2)}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            {/* Pie chart */}
+                            <div className="panel" style={{ marginTop: 16 }}>
+                              <div className="panel-head">
+                                <span className="panel-title">
+                                  <span
+                                    className="panel-title-dot"
+                                    style={{ background: "var(--violet)" }}
+                                  />{" "}
+                                  Portfolio Split
+                                </span>
+                              </div>
+                              <div className="panel-body">
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    gap: 20,
+                                    flexWrap: "wrap",
+                                    alignItems: "center",
+                                  }}
+                                >
+                                  <ResponsiveContainer width={220} height={220}>
+                                    <PieChart>
+                                      <Pie
+                                        data={pieData}
+                                        dataKey="value"
+                                        cx="50%"
+                                        cy="50%"
+                                        innerRadius={55}
+                                        outerRadius={90}
+                                        paddingAngle={3}
+                                      >
+                                        {pieData.map((_, i) => (
+                                          <Cell key={i} fill={P[i]} />
+                                        ))}
+                                      </Pie>
+                                      <Tooltip content={<TT />} />
+                                    </PieChart>
+                                  </ResponsiveContainer>
+                                  <div
+                                    style={{
+                                      flex: 1,
+                                      display: "grid",
+                                      gridTemplateColumns:
+                                        "repeat(auto-fill,minmax(150px,1fr))",
+                                      gap: 8,
+                                    }}
+                                  >
+                                    {pieData.map((d, i) => (
+                                      <div
+                                        key={d.name}
+                                        style={{
+                                          display: "flex",
+                                          alignItems: "center",
+                                          gap: 8,
+                                          cursor: "pointer",
+                                        }}
+                                        onClick={() => {
+                                          const wh = WAREHOUSES.find(
+                                            (w) => w.label === d.name
+                                          );
+                                          if (wh) drillWarehouse(wh);
+                                        }}
+                                      >
+                                        <div
+                                          style={{
+                                            width: 10,
+                                            height: 10,
+                                            background: P[i],
+                                            borderRadius: 3,
+                                            flexShrink: 0,
+                                          }}
+                                        />
+                                        <div>
+                                          <div
+                                            style={{
+                                              fontSize: 12,
+                                              fontWeight: 600,
+                                              color: "var(--text)",
+                                            }}
+                                          >
+                                            {d.name}
+                                          </div>
+                                          <div
+                                            style={{
+                                              fontFamily: "JetBrains Mono",
+                                              fontSize: 10,
+                                              color: "var(--muted)",
+                                            }}
+                                          >
+                                            {fmt(d.value)}
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
                             </div>
                           </div>
-                          <div className="panel fade-up a3">
+                        )}
+
+                        {/* ═══════════════════════════════════════════════════
+              DATA TABLE TAB
+          ═══════════════════════════════════════════════════ */}
+                        {tab === "data" && (
+                          <div className="panel fade-up">
                             <div className="panel-head">
                               <span className="panel-title">
                                 <span
                                   className="panel-title-dot"
                                   style={{ background: "var(--teal)" }}
                                 />{" "}
-                                Top 10 Customers
+                                Granular Data · {report.reportDateStr}
                               </span>
-                              <span
-                                style={{
-                                  fontSize: 10,
-                                  fontFamily: "JetBrains Mono",
-                                  color: "var(--muted)",
-                                }}
-                              >
-                                Click to drill
-                              </span>
-                            </div>
-                            <div className="panel-body">
-                              <ResponsiveContainer width="100%" height={200}>
-                                <BarChart
-                                  layout="vertical"
-                                  data={[...report.rows]
-                                    .sort((a, b) => b.grandTotal - a.grandTotal)
-                                    .slice(0, 10)
-                                    .map((r) => ({
-                                      name:
-                                        r.customerName.length > 18
-                                          ? r.customerName.slice(0, 18) + "…"
-                                          : r.customerName,
-                                      value: r.grandTotal,
-                                      _row: r,
-                                    }))}
-                                  onClick={(d) => {
-                                    if (d?.activePayload?.[0]) {
-                                      const row =
-                                        d.activePayload[0].payload._row;
-                                      if (row) drillCustomer(row);
-                                    }
-                                  }}
-                                >
-                                  <CartesianGrid
-                                    strokeDasharray="3 3"
-                                    stroke="var(--border)"
-                                    horizontal={false}
-                                  />
-                                  <XAxis type="number" hide />
-                                  <YAxis
-                                    type="category"
-                                    dataKey="name"
-                                    tick={{
-                                      fill: "var(--muted)",
-                                      fontSize: 9,
-                                      fontFamily: "JetBrains Mono",
-                                    }}
-                                    axisLine={false}
-                                    tickLine={false}
-                                    width={120}
-                                  />
-                                  <Tooltip content={<TT />} />
-                                  <Bar
-                                    dataKey="value"
-                                    name="Units"
-                                    radius={[0, 4, 4, 0]}
-                                    style={{ cursor: "pointer" }}
-                                  >
-                                    {[...Array(10)].map((_, i) => (
-                                      <Cell key={i} fill={P[i]} />
-                                    ))}
-                                  </Bar>
-                                </BarChart>
-                              </ResponsiveContainer>
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* PORTFOLIO TREND */}
-                        <div className="panel fade-up a4">
-                          <div className="panel-head">
-                            <span className="panel-title">
-                              <span
-                                className="panel-title-dot"
-                                style={{ background: "var(--sky)" }}
-                              />{" "}
-                              Portfolio Stock Trend
-                            </span>
-                          </div>
-                          <div className="panel-body">
-                            <ResponsiveContainer width="100%" height={180}>
-                              <AreaChart data={tsTotals}>
-                                <defs>
-                                  <linearGradient
-                                    id="totDg"
-                                    x1="0"
-                                    y1="0"
-                                    x2="0"
-                                    y2="1"
-                                  >
-                                    <stop
-                                      offset="5%"
-                                      stopColor="var(--sky)"
-                                      stopOpacity={0.3}
-                                    />
-                                    <stop
-                                      offset="95%"
-                                      stopColor="var(--sky)"
-                                      stopOpacity={0}
-                                    />
-                                  </linearGradient>
-                                </defs>
-                                <CartesianGrid
-                                  strokeDasharray="3 3"
-                                  stroke="var(--border)"
-                                  vertical={false}
-                                />
-                                <XAxis
-                                  dataKey="date"
-                                  tick={{
-                                    fill: "var(--muted)",
-                                    fontSize: 9,
-                                    fontFamily: "JetBrains Mono",
-                                  }}
-                                  axisLine={false}
-                                  tickLine={false}
-                                />
-                                <YAxis hide />
-                                <Tooltip content={<TT />} />
-                                <Area
-                                  type="monotone"
-                                  dataKey="Total"
-                                  stroke="var(--sky)"
-                                  strokeWidth={2.5}
-                                  fill="url(#totDg)"
-                                  dot={false}
-                                />
-                              </AreaChart>
-                            </ResponsiveContainer>
-                          </div>
-                        </div>
-
-                        {/* KPI CARDS */}
-                        <div className="card-grid">
-                          {WAREHOUSES.map((wh, i) => {
-                            const v = report.grandTotals?.[wh.key] || 0;
-                            const pv2 = prev?.grandTotals?.[wh.key] || 0;
-                            const d2 = v - pv2;
-                            const dp =
-                              pv2 > 0 ? ((d2 / pv2) * 100).toFixed(1) : null;
-                            return (
-                              <div
-                                key={wh.key}
-                                className="card clickable fade-up"
-                                style={{ animationDelay: `${i * 0.04}s` }}
-                                onClick={() => drillWarehouse(wh)}
-                              >
-                                <div
-                                  className="card-accent"
-                                  style={{ background: P[i] }}
-                                />
-                                <div className="card-label">{wh.label}</div>
-                                <div
-                                  className="card-value"
-                                  style={{ color: P[i] }}
-                                >
-                                  {fmt(v)}
-                                </div>
-                                <div className="card-sub">
-                                  {dp !== null && (
-                                    <span
-                                      style={{
-                                        color:
-                                          d2 >= 0
-                                            ? "var(--teal)"
-                                            : "var(--coral)",
-                                        fontFamily: "JetBrains Mono",
-                                        fontSize: 11,
-                                      }}
-                                    >
-                                      {d2 >= 0 ? "+" : ""}
-                                      {dp}%{" "}
-                                    </span>
-                                  )}
-                                  {pct(v, report.grandTotals?.overall || 1)} of
-                                  total
-                                </div>
-                                <div className="card-badge">drill ›</div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </>
-                    )}
-
-                    {/* ═══════════════════════════════════════════════════
-              TRENDS TAB
-          ═══════════════════════════════════════════════════ */}
-                    {tab === "trends" && (
-                      <>
-                        <div className="panel fade-up">
-                          <div className="panel-head">
-                            <span className="panel-title">
-                              <span
-                                className="panel-title-dot"
-                                style={{ background: "var(--sky)" }}
-                              />{" "}
-                              Warehouse Stock Over Time
-                            </span>
-                          </div>
-                          <div className="panel-body">
-                            <ResponsiveContainer width="100%" height={260}>
-                              <LineChart data={tsTotals}>
-                                <CartesianGrid
-                                  strokeDasharray="3 3"
-                                  stroke="var(--border)"
-                                  vertical={false}
-                                />
-                                <XAxis
-                                  dataKey="date"
-                                  tick={{
-                                    fill: "var(--muted)",
-                                    fontSize: 9,
-                                    fontFamily: "JetBrains Mono",
-                                  }}
-                                  axisLine={false}
-                                  tickLine={false}
-                                />
-                                <YAxis hide />
-                                <Tooltip content={<TT />} />
-                                <Legend
-                                  wrapperStyle={{
-                                    fontSize: 10,
-                                    fontFamily: "JetBrains Mono",
-                                  }}
-                                />
-                                {WAREHOUSES.map((w, i) => (
-                                  <Line
-                                    key={w.key}
-                                    type="monotone"
-                                    dataKey={w.label}
-                                    stroke={P[i]}
-                                    strokeWidth={2}
-                                    dot={false}
-                                    activeDot={{ r: 5 }}
-                                  />
-                                ))}
-                              </LineChart>
-                            </ResponsiveContainer>
-                          </div>
-                        </div>
-                        <div className="panel fade-up a2">
-                          <div className="panel-head">
-                            <span className="panel-title">
-                              <span
-                                className="panel-title-dot"
-                                style={{ background: "var(--teal)" }}
-                              />{" "}
-                              Customer Stock Trends
-                            </span>
-                            <div
-                              style={{
-                                display: "flex",
-                                gap: 6,
-                                flexWrap: "wrap",
-                              }}
-                            >
-                              <div className="wh-pills">
-                                {[
-                                  { key: "grandTotal", label: "Total" },
-                                  ...WAREHOUSES,
-                                ].map((w) => (
-                                  <div
-                                    key={w.key}
-                                    className={`wh-pill${
-                                      selectedWH === w.key ? " on" : ""
-                                    }`}
-                                    onClick={() => setSelectedWH(w.key)}
-                                  >
-                                    {w.label || w.short}
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          </div>
-                          <div className="panel-body">
-                            <ResponsiveContainer width="100%" height={240}>
-                              <LineChart data={custLines.data}>
-                                <CartesianGrid
-                                  strokeDasharray="3 3"
-                                  stroke="var(--border)"
-                                  vertical={false}
-                                />
-                                <XAxis
-                                  dataKey="date"
-                                  tick={{
-                                    fill: "var(--muted)",
-                                    fontSize: 9,
-                                    fontFamily: "JetBrains Mono",
-                                  }}
-                                  axisLine={false}
-                                  tickLine={false}
-                                />
-                                <YAxis hide />
-                                <Tooltip content={<TT />} />
-                                <Legend
-                                  wrapperStyle={{
-                                    fontSize: 10,
-                                    fontFamily: "JetBrains Mono",
-                                  }}
-                                />
-                                {custLines.keys.map((k, i) => (
-                                  <Line
-                                    key={k}
-                                    type="monotone"
-                                    dataKey={k}
-                                    stroke={P[i]}
-                                    strokeWidth={2}
-                                    dot={false}
-                                    activeDot={{ r: 4 }}
-                                  />
-                                ))}
-                              </LineChart>
-                            </ResponsiveContainer>
-                          </div>
-                        </div>
-                        <div className="panel fade-up a3">
-                          <div className="panel-head">
-                            <span className="panel-title">
-                              <span
-                                className="panel-title-dot"
-                                style={{ background: "var(--amber)" }}
-                              />{" "}
-                              Warehouse Share — Stacked Area
-                            </span>
-                          </div>
-                          <div className="panel-body">
-                            <ResponsiveContainer width="100%" height={200}>
-                              <AreaChart data={tsTotals}>
-                                <CartesianGrid
-                                  strokeDasharray="3 3"
-                                  stroke="var(--border)"
-                                  vertical={false}
-                                />
-                                <XAxis
-                                  dataKey="date"
-                                  tick={{
-                                    fill: "var(--muted)",
-                                    fontSize: 9,
-                                    fontFamily: "JetBrains Mono",
-                                  }}
-                                  axisLine={false}
-                                  tickLine={false}
-                                />
-                                <YAxis hide />
-                                <Tooltip content={<TT />} />
-                                <Legend
-                                  wrapperStyle={{
-                                    fontSize: 10,
-                                    fontFamily: "JetBrains Mono",
-                                  }}
-                                />
-                                {WAREHOUSES.map((w, i) => (
-                                  <Area
-                                    key={w.key}
-                                    type="monotone"
-                                    dataKey={w.label}
-                                    stackId="1"
-                                    stroke={P[i]}
-                                    fill={P[i] + "55"}
-                                    strokeWidth={1.5}
-                                    dot={false}
-                                  />
-                                ))}
-                              </AreaChart>
-                            </ResponsiveContainer>
-                          </div>
-                        </div>
-                      </>
-                    )}
-
-                    {/* ═══════════════════════════════════════════════════
-              WAREHOUSES TAB
-          ═══════════════════════════════════════════════════ */}
-                    {tab === "warehouses" && (
-                      <div className="fade-up">
-                        <div className="wh-grid">
-                          {WAREHOUSES.map((wh, wi) => {
-                            const v = report.grandTotals?.[wh.key] || 0;
-                            const pv2 = prev?.grandTotals?.[wh.key] || 0;
-                            const d2 = v - pv2;
-                            const ts2 = reports.map(
-                              (r) => r.grandTotals?.[wh.key] || 0
-                            );
-                            const mx = Math.max(...ts2, 1);
-                            const share =
-                              report.grandTotals?.overall > 0
-                                ? (
-                                    (v / report.grandTotals.overall) *
-                                    100
-                                  ).toFixed(1)
-                                : "0";
-                            const custCount = report.rows.filter(
-                              (r) => (r[wh.key] || 0) > 0
-                            ).length;
-                            return (
-                              <div
-                                key={wh.key}
-                                className="wh-tile fade-up"
-                                style={{ animationDelay: `${wi * 0.05}s` }}
-                                onClick={() => drillWarehouse(wh)}
-                              >
-                                <div
-                                  className="wh-tile-bar"
-                                  style={{ background: P[wi] }}
-                                />
-                                <div className="wh-tile-body">
-                                  <div
-                                    className="wh-tile-share"
-                                    style={{ color: P[wi] }}
-                                  >
-                                    {share}%
-                                  </div>
-                                  <div
-                                    className="wh-tile-name"
-                                    style={{ color: P[wi] }}
-                                  >
-                                    {wh.label}
-                                  </div>
-                                  <div className="wh-tile-val">{fmt(v)}</div>
-                                  <div
-                                    style={{
-                                      display: "flex",
-                                      gap: 2,
-                                      alignItems: "flex-end",
-                                      marginBottom: 10,
-                                      height: 32,
-                                    }}
-                                  >
-                                    {ts2.map((tv, j) => {
-                                      const bh = Math.max(
-                                        3,
-                                        Math.round((tv / mx) * 32)
-                                      );
-                                      const isLast = j === ts2.length - 1;
-                                      return (
-                                        <div
-                                          key={j}
-                                          style={{
-                                            width: 6,
-                                            height: bh,
-                                            background: isLast
-                                              ? P[wi]
-                                              : P[wi] + "55",
-                                            borderRadius: 2,
-                                            transition: "height .3s",
-                                          }}
-                                        />
-                                      );
-                                    })}
-                                  </div>
-                                  <div className="wh-tile-meta">
-                                    <span>{custCount} customers</span>
-                                    <span
-                                      style={{
-                                        color:
-                                          d2 >= 0
-                                            ? "var(--teal)"
-                                            : "var(--coral)",
-                                        fontFamily: "JetBrains Mono",
-                                        fontSize: 11,
-                                      }}
-                                    >
-                                      {d2 >= 0 ? "+" : ""}
-                                      {fmt(d2)}
-                                    </span>
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                        {/* Pie chart */}
-                        <div className="panel" style={{ marginTop: 16 }}>
-                          <div className="panel-head">
-                            <span className="panel-title">
-                              <span
-                                className="panel-title-dot"
-                                style={{ background: "var(--violet)" }}
-                              />{" "}
-                              Portfolio Split
-                            </span>
-                          </div>
-                          <div className="panel-body">
-                            <div
-                              style={{
-                                display: "flex",
-                                gap: 20,
-                                flexWrap: "wrap",
-                                alignItems: "center",
-                              }}
-                            >
-                              <ResponsiveContainer width={220} height={220}>
-                                <PieChart>
-                                  <Pie
-                                    data={pieData}
-                                    dataKey="value"
-                                    cx="50%"
-                                    cy="50%"
-                                    innerRadius={55}
-                                    outerRadius={90}
-                                    paddingAngle={3}
-                                  >
-                                    {pieData.map((_, i) => (
-                                      <Cell key={i} fill={P[i]} />
-                                    ))}
-                                  </Pie>
-                                  <Tooltip content={<TT />} />
-                                </PieChart>
-                              </ResponsiveContainer>
                               <div
                                 style={{
-                                  flex: 1,
-                                  display: "grid",
-                                  gridTemplateColumns:
-                                    "repeat(auto-fill,minmax(150px,1fr))",
+                                  display: "flex",
                                   gap: 8,
+                                  alignItems: "center",
+                                  flexWrap: "wrap",
                                 }}
                               >
-                                {pieData.map((d, i) => (
-                                  <div
-                                    key={d.name}
-                                    style={{
-                                      display: "flex",
-                                      alignItems: "center",
-                                      gap: 8,
-                                      cursor: "pointer",
-                                    }}
-                                    onClick={() => {
-                                      const wh = WAREHOUSES.find(
-                                        (w) => w.label === d.name
-                                      );
-                                      if (wh) drillWarehouse(wh);
-                                    }}
-                                  >
-                                    <div
-                                      style={{
-                                        width: 10,
-                                        height: 10,
-                                        background: P[i],
-                                        borderRadius: 3,
-                                        flexShrink: 0,
-                                      }}
-                                    />
-                                    <div>
-                                      <div
-                                        style={{
-                                          fontSize: 12,
-                                          fontWeight: 600,
-                                          color: "var(--text)",
-                                        }}
-                                      >
-                                        {d.name}
-                                      </div>
-                                      <div
-                                        style={{
-                                          fontFamily: "JetBrains Mono",
-                                          fontSize: 10,
-                                          color: "var(--muted)",
-                                        }}
-                                      >
-                                        {fmt(d.value)}
-                                      </div>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* ═══════════════════════════════════════════════════
-              DATA TABLE TAB
-          ═══════════════════════════════════════════════════ */}
-                    {tab === "data" && (
-                      <div className="panel fade-up">
-                        <div className="panel-head">
-                          <span className="panel-title">
-                            <span
-                              className="panel-title-dot"
-                              style={{ background: "var(--teal)" }}
-                            />{" "}
-                            Granular Data · {report.reportDateStr}
-                          </span>
-                          <div
-                            style={{
-                              display: "flex",
-                              gap: 8,
-                              alignItems: "center",
-                              flexWrap: "wrap",
-                            }}
-                          >
-                            <div className="search-box">
-                              <span className="search-icon">⌕</span>
-                              <input
-                                placeholder="Search customer…"
-                                value={searchQ}
-                                onChange={(e) => setSearchQ(e.target.value)}
-                              />
-                            </div>
-                            <button
-                              className="btn btn-ghost btn-sm"
-                              onClick={() =>
-                                dlCSV(
-                                  filteredRows,
-                                  `stock_${report.reportDateStr}.csv`
-                                )
-                              }
-                            >
-                              ⬇ CSV
-                            </button>
-                          </div>
-                        </div>
-                        <div className="report-strip">
-                          {reports.map((r) => (
-                            <div
-                              key={r._id}
-                              className={`rchip${
-                                selectedReportId === r._id ? " on" : ""
-                              }`}
-                              onClick={() => setSelectedReportId(r._id)}
-                            >
-                              {r.reportDateStr}
-                            </div>
-                          ))}
-                        </div>
-                        {/* Customer legend sidebar + table */}
-                        <div style={{ display: "flex", gap: 0 }}>
-                          <div
-                            style={{
-                              width: 200,
-                              minWidth: 160,
-                              borderRight: "1px solid var(--border)",
-                              padding: "12px 10px",
-                              overflowY: "auto",
-                              maxHeight: "calc(100vh - 280px)",
-                            }}
-                          >
-                            <div
-                              style={{
-                                fontFamily: "JetBrains Mono",
-                                fontSize: 9,
-                                color: "var(--muted)",
-                                textTransform: "uppercase",
-                                letterSpacing: ".09em",
-                                marginBottom: 8,
-                              }}
-                            >
-                              Customers
-                            </div>
-                            {allRows.map((r, i) => {
-                              const k = `${r.customerName}__${r.wp}`;
-                              const hidden = hiddenCustomers.has(k);
-                              return (
-                                <div
-                                  key={k}
-                                  className={`cust-chip${hidden ? " off" : ""}`}
+                                <div className="search-box">
+                                  <span className="search-icon">⌕</span>
+                                  <input
+                                    placeholder="Search customer…"
+                                    value={searchQ}
+                                    onChange={(e) => setSearchQ(e.target.value)}
+                                  />
+                                </div>
+                                <button
+                                  className="btn btn-ghost btn-sm"
                                   onClick={() =>
-                                    setHiddenCustomers((h) => {
-                                      const n = new Set(h);
-                                      n.has(k) ? n.delete(k) : n.add(k);
-                                      return n;
-                                    })
+                                    dlCSV(
+                                      filteredRows,
+                                      `stock_${report.reportDateStr}.csv`
+                                    )
                                   }
                                 >
-                                  <div
-                                    className="chip-dot"
-                                    style={{ background: P[i % P.length] }}
-                                  />
-                                  <span className="chip-name">
-                                    {r.customerName}
-                                  </span>
-                                  <span className="chip-val">
-                                    {fmt(r.grandTotal)}
-                                  </span>
+                                  ⬇ CSV
+                                </button>
+                              </div>
+                            </div>
+                            <div className="report-strip">
+                              {reports.map((r) => (
+                                <div
+                                  key={r._id}
+                                  className={`rchip${
+                                    selectedReportId === r._id ? " on" : ""
+                                  }`}
+                                  onClick={() => setSelectedReportId(r._id)}
+                                >
+                                  {r.reportDateStr}
                                 </div>
-                              );
-                            })}
-                          </div>
-                          <div
-                            className="tbl-wrap"
-                            style={{
-                              flex: 1,
-                              maxHeight: "calc(100vh - 280px)",
-                            }}
-                          >
-                            <table>
-                              <thead>
-                                <tr>
-                                  <th style={{ textAlign: "left" }}>Sl</th>
-                                  <th
-                                    className={`sortable${
-                                      sortCol === "customerName"
-                                        ? " sort-on"
-                                        : ""
-                                    }`}
-                                    style={{ textAlign: "left" }}
-                                    onClick={() => toggleSort("customerName")}
-                                  >
-                                    Customer{" "}
-                                    {sortCol === "customerName"
-                                      ? sortDir === "asc"
-                                        ? "↑"
-                                        : "↓"
-                                      : ""}
-                                  </th>
-                                  <th
-                                    className={`sortable${
-                                      sortCol === "wp" ? " sort-on" : ""
-                                    }`}
-                                    style={{ textAlign: "left" }}
-                                    onClick={() => toggleSort("wp")}
-                                  >
-                                    WP{" "}
-                                    {sortCol === "wp"
-                                      ? sortDir === "asc"
-                                        ? "↑"
-                                        : "↓"
-                                      : ""}
-                                  </th>
-                                  {WAREHOUSES.map((w) => (
-                                    <th
-                                      key={w.key}
-                                      className={`sortable${
-                                        sortCol === w.key ? " sort-on" : ""
+                              ))}
+                            </div>
+                            {/* Customer legend sidebar + table */}
+                            <div style={{ display: "flex", gap: 0 }}>
+                              <div
+                                style={{
+                                  width: 200,
+                                  minWidth: 160,
+                                  borderRight: "1px solid var(--border)",
+                                  padding: "12px 10px",
+                                  overflowY: "auto",
+                                  maxHeight: "calc(100vh - 280px)",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    fontFamily: "JetBrains Mono",
+                                    fontSize: 9,
+                                    color: "var(--muted)",
+                                    textTransform: "uppercase",
+                                    letterSpacing: ".09em",
+                                    marginBottom: 8,
+                                  }}
+                                >
+                                  Customers
+                                </div>
+                                {allRows.map((r, i) => {
+                                  const k = `${r.customerName}__${r.wp}`;
+                                  const hidden = hiddenCustomers.has(k);
+                                  return (
+                                    <div
+                                      key={k}
+                                      className={`cust-chip${
+                                        hidden ? " off" : ""
                                       }`}
-                                      onClick={() => toggleSort(w.key)}
+                                      onClick={() =>
+                                        setHiddenCustomers((h) => {
+                                          const n = new Set(h);
+                                          n.has(k) ? n.delete(k) : n.add(k);
+                                          return n;
+                                        })
+                                      }
                                     >
-                                      {w.short}{" "}
-                                      {sortCol === w.key
-                                        ? sortDir === "asc"
-                                          ? "↑"
-                                          : "↓"
-                                        : ""}
-                                    </th>
-                                  ))}
-                                  <th
-                                    className={`sortable${
-                                      sortCol === "grandTotal" ? " sort-on" : ""
-                                    }`}
-                                    onClick={() => toggleSort("grandTotal")}
-                                  >
-                                    Total{" "}
-                                    {sortCol === "grandTotal"
-                                      ? sortDir === "asc"
-                                        ? "↑"
-                                        : "↓"
-                                      : ""}
-                                  </th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {filteredRows.map((row, i) => (
-                                  <tr
-                                    key={`${row.customerName}_${row.wp}_${i}`}
-                                    className="clickable"
-                                    onClick={() => drillCustomer(row)}
-                                  >
-                                    <td>{row.slNo}</td>
-                                    <td style={{ textAlign: "left" }}>
-                                      <span
-                                        style={{
-                                          display: "flex",
-                                          alignItems: "center",
-                                          gap: 7,
-                                        }}
-                                      >
-                                        <span
-                                          style={{
-                                            width: 7,
-                                            height: 7,
-                                            background: P[row.slNo % P.length],
-                                            borderRadius: 2,
-                                            display: "inline-block",
-                                            flexShrink: 0,
-                                          }}
-                                        />
-                                        <span
-                                          style={{
-                                            color: "var(--text)",
-                                            fontWeight: 500,
-                                          }}
-                                        >
-                                          {row.customerName}
-                                        </span>
+                                      <div
+                                        className="chip-dot"
+                                        style={{ background: P[i % P.length] }}
+                                      />
+                                      <span className="chip-name">
+                                        {r.customerName}
                                       </span>
-                                    </td>
-                                    <td
-                                      style={{
-                                        textAlign: "left",
-                                        fontFamily: "JetBrains Mono",
-                                        fontSize: 11,
-                                      }}
-                                    >
-                                      {row.wp}
-                                    </td>
-                                    {WAREHOUSES.map((w) => (
-                                      <td
-                                        key={w.key}
-                                        className={
-                                          row[w.key] === 0
-                                            ? "td0"
-                                            : row[w.key] > 50000
-                                            ? "td-hi"
+                                      <span className="chip-val">
+                                        {fmt(r.grandTotal)}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                              <div
+                                className="tbl-wrap"
+                                style={{
+                                  flex: 1,
+                                  maxHeight: "calc(100vh - 280px)",
+                                }}
+                              >
+                                <table>
+                                  <thead>
+                                    <tr>
+                                      <th style={{ textAlign: "left" }}>Sl</th>
+                                      <th
+                                        className={`sortable${
+                                          sortCol === "customerName"
+                                            ? " sort-on"
                                             : ""
+                                        }`}
+                                        style={{ textAlign: "left" }}
+                                        onClick={() =>
+                                          toggleSort("customerName")
                                         }
-                                        style={{
-                                          cursor:
-                                            row[w.key] > 0 ? "pointer" : "",
-                                        }}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          if (row[w.key] > 0) drillCxW(row, w);
-                                        }}
                                       >
-                                        {row[w.key] === 0 ? (
-                                          "—"
-                                        ) : (
+                                        Customer{" "}
+                                        {sortCol === "customerName"
+                                          ? sortDir === "asc"
+                                            ? "↑"
+                                            : "↓"
+                                          : ""}
+                                      </th>
+                                      <th
+                                        className={`sortable${
+                                          sortCol === "wp" ? " sort-on" : ""
+                                        }`}
+                                        style={{ textAlign: "left" }}
+                                        onClick={() => toggleSort("wp")}
+                                      >
+                                        WP{" "}
+                                        {sortCol === "wp"
+                                          ? sortDir === "asc"
+                                            ? "↑"
+                                            : "↓"
+                                          : ""}
+                                      </th>
+                                      {WAREHOUSES.map((w) => (
+                                        <th
+                                          key={w.key}
+                                          className={`sortable${
+                                            sortCol === w.key ? " sort-on" : ""
+                                          }`}
+                                          onClick={() => toggleSort(w.key)}
+                                        >
+                                          {w.short}{" "}
+                                          {sortCol === w.key
+                                            ? sortDir === "asc"
+                                              ? "↑"
+                                              : "↓"
+                                            : ""}
+                                        </th>
+                                      ))}
+                                      <th
+                                        className={`sortable${
+                                          sortCol === "grandTotal"
+                                            ? " sort-on"
+                                            : ""
+                                        }`}
+                                        onClick={() => toggleSort("grandTotal")}
+                                      >
+                                        Total{" "}
+                                        {sortCol === "grandTotal"
+                                          ? sortDir === "asc"
+                                            ? "↑"
+                                            : "↓"
+                                          : ""}
+                                      </th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {filteredRows.map((row, i) => (
+                                      <tr
+                                        key={`${row.customerName}_${row.wp}_${i}`}
+                                        className="clickable"
+                                        onClick={() => drillCustomer(row)}
+                                      >
+                                        <td>{row.slNo}</td>
+                                        <td style={{ textAlign: "left" }}>
                                           <span
                                             style={{
-                                              fontFamily: "JetBrains Mono",
-                                              fontSize: 11,
+                                              display: "flex",
+                                              alignItems: "center",
+                                              gap: 7,
                                             }}
                                           >
-                                            {fmt(row[w.key])}
+                                            <span
+                                              style={{
+                                                width: 7,
+                                                height: 7,
+                                                background:
+                                                  P[row.slNo % P.length],
+                                                borderRadius: 2,
+                                                display: "inline-block",
+                                                flexShrink: 0,
+                                              }}
+                                            />
+                                            <span
+                                              style={{
+                                                color: "var(--text)",
+                                                fontWeight: 500,
+                                              }}
+                                            >
+                                              {row.customerName}
+                                            </span>
                                           </span>
-                                        )}
-                                      </td>
+                                        </td>
+                                        <td
+                                          style={{
+                                            textAlign: "left",
+                                            fontFamily: "JetBrains Mono",
+                                            fontSize: 11,
+                                          }}
+                                        >
+                                          {row.wp}
+                                        </td>
+                                        {WAREHOUSES.map((w) => (
+                                          <td
+                                            key={w.key}
+                                            className={
+                                              row[w.key] === 0
+                                                ? "td0"
+                                                : row[w.key] > 50000
+                                                ? "td-hi"
+                                                : ""
+                                            }
+                                            style={{
+                                              cursor:
+                                                row[w.key] > 0 ? "pointer" : "",
+                                            }}
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              if (row[w.key] > 0)
+                                                drillCxW(row, w);
+                                            }}
+                                          >
+                                            {row[w.key] === 0 ? (
+                                              "—"
+                                            ) : (
+                                              <span
+                                                style={{
+                                                  fontFamily: "JetBrains Mono",
+                                                  fontSize: 11,
+                                                }}
+                                              >
+                                                {fmt(row[w.key])}
+                                              </span>
+                                            )}
+                                          </td>
+                                        ))}
+                                        <td className="td-total">
+                                          {fmt(row.grandTotal)}
+                                        </td>
+                                      </tr>
                                     ))}
-                                    <td className="td-total">
-                                      {fmt(row.grandTotal)}
-                                    </td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                              <tfoot>
-                                <tr>
-                                  <td>—</td>
-                                  <td style={{ textAlign: "left" }}>
-                                    Grand Total
-                                  </td>
-                                  <td />
-                                  {WAREHOUSES.map((w) => (
-                                    <td
-                                      key={w.key}
-                                      style={{
-                                        fontFamily: "JetBrains Mono",
-                                        fontSize: 11,
-                                      }}
-                                    >
-                                      {fmt(report.grandTotals?.[w.key])}
-                                    </td>
-                                  ))}
-                                  <td
-                                    style={{
-                                      color: "var(--teal)",
-                                      fontFamily: "JetBrains Mono",
-                                    }}
-                                  >
-                                    {fmt(report.grandTotals?.overall)}
-                                  </td>
-                                </tr>
-                              </tfoot>
-                            </table>
+                                  </tbody>
+                                  <tfoot>
+                                    <tr>
+                                      <td>—</td>
+                                      <td style={{ textAlign: "left" }}>
+                                        Grand Total
+                                      </td>
+                                      <td />
+                                      {WAREHOUSES.map((w) => (
+                                        <td
+                                          key={w.key}
+                                          style={{
+                                            fontFamily: "JetBrains Mono",
+                                            fontSize: 11,
+                                          }}
+                                        >
+                                          {fmt(report.grandTotals?.[w.key])}
+                                        </td>
+                                      ))}
+                                      <td
+                                        style={{
+                                          color: "var(--teal)",
+                                          fontFamily: "JetBrains Mono",
+                                        }}
+                                      >
+                                        {fmt(report.grandTotals?.overall)}
+                                      </td>
+                                    </tr>
+                                  </tfoot>
+                                </table>
+                              </div>
+                            </div>
                           </div>
-                        </div>
-                      </div>
-                    )}
+                        )}
 
-                    {/* ═══════════════════════════════════════════════════
+                        {/* ═══════════════════════════════════════════════════
               INTELLIGENCE TAB
           ═══════════════════════════════════════════════════ */}
-                    {tab === "intel" && (
-                      <IntelligenceTab reports={reports} report={report} />
+                        {tab === "intel" && (
+                          <IntelligenceTab reports={reports} report={report} />
+                        )}
+                      </>
                     )}
+                    {/* end drill.level===0 */}
                   </>
                 )}
+                {/* end report guard */}
               </div>
               {/* end .content */}
             </div>
